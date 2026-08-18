@@ -242,3 +242,55 @@ wait_for_log_rows asynchronous_insert_log 1 "
 "
 echo "$LOG_ROW_COUNT"
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE test_04633_break"
+
+# Case 6: `KILL QUERY` while the transform waits for the queued block to flush must surface as a
+# cancelled query, not a silent success. `QueryStatus::cancelQuery` marks the query killed before
+# it cancels the pipeline executors, so the wait loop's own cancellation check must consult
+# `throwIfKilled()` itself; simply returning on a bare `isCancelled()` would let the pipeline finish
+# cleanly and record `QueryFinish` for a query that never actually flushed.
+${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS test_04633_kill"
+${CLICKHOUSE_CLIENT} -q "CREATE TABLE test_04633_kill (n UInt64) ENGINE = MergeTree ORDER BY n"
+
+KILL_ID="test_04633_kill_$RANDOM"
+KILL_OUT=$(mktemp)
+${CLICKHOUSE_CLIENT} --query_id="$KILL_ID" -q "
+    INSERT INTO test_04633_kill SELECT number FROM numbers(3)
+    SETTINGS async_insert = 1, wait_for_async_insert = 1,
+             async_insert_use_adaptive_busy_timeout = 0,
+             async_insert_busy_timeout_min_ms = 30000, async_insert_busy_timeout_max_ms = 30000,
+             max_threads = 1, max_insert_threads = 1
+" > "$KILL_OUT" 2>&1 &
+INSERT_PID=$!
+wait_for_query_to_start "$KILL_ID" 30
+${CLICKHOUSE_CLIENT} -q "KILL QUERY WHERE query_id = '$KILL_ID' SYNC FORMAT Null"
+wait "$INSERT_PID"
+INSERT_EXIT=$?
+[ "$INSERT_EXIT" -ne 0 ] && echo "client saw the insert fail" || echo "client saw the insert succeed"
+grep -q QUERY_WAS_CANCELLED "$KILL_OUT" && echo "client error mentions QUERY_WAS_CANCELLED" || echo "client error did not mention QUERY_WAS_CANCELLED"
+rm -f "$KILL_OUT"
+
+wait_for_log_rows query_log 1 "
+    SELECT count()
+    FROM system.query_log
+    WHERE event_date >= yesterday() AND event_time >= now() - 600
+      AND current_database = currentDatabase() AND type = 'ExceptionWhileProcessing'
+      AND query_id = '$KILL_ID'
+"
+${CLICKHOUSE_CLIENT} -q "
+    SELECT exception_code
+    FROM system.query_log
+    WHERE event_date >= yesterday() AND event_time >= now() - 600
+      AND current_database = currentDatabase() AND type = 'ExceptionWhileProcessing'
+      AND query_id = '$KILL_ID'
+"
+
+# The block was queued before the kill landed, so the queue still flushes it in the background
+# (documented behaviour: cancelling stops the wait, not the write). Drain that flush before
+# dropping the table so the async queue is not left pointing at a table that no longer exists.
+wait_for_log_rows asynchronous_insert_log 1 "
+    SELECT count()
+    FROM system.asynchronous_insert_log
+    WHERE event_date >= yesterday() AND event_time >= now() - 600
+      AND database = currentDatabase() AND table = 'test_04633_kill'
+"
+${CLICKHOUSE_CLIENT} -q "DROP TABLE test_04633_kill"

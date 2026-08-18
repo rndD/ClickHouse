@@ -232,7 +232,15 @@ AsyncInsertQueueTransform::GenerateResult AsyncInsertQueueTransform::getRemainin
                 break;
 
             if (isCancelled())
+            {
+                /// `cancelQuery` sets `is_killed` before cancelling the pipeline executors, so a `KILL
+                /// QUERY` (or `max_execution_time`) is visible here as `throwIfKilled()`. Without this,
+                /// a cancelled-but-otherwise-clean pipeline would finish silently and the query would be
+                /// logged as successful even though the flush may still be running or fail in background.
+                if (auto process_list_elem = context->getProcessListElement())
+                    process_list_elem->throwIfKilled();
                 return {};
+            }
 
             if (auto process_list_elem = context->getProcessListElement())
             {
